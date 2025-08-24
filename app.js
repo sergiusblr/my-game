@@ -57,7 +57,7 @@
     ageYears: null,
     lang: "ru",
     offset: 0,
-    limit: 24,
+    limit: 18,
     totalLoaded: 0,
     isLoading: false,
     lastQueryKey: "",
@@ -163,10 +163,37 @@ OFFSET ${offset}`;
     return query;
   }
 
+  function sleep(ms) { return new Promise((res) => setTimeout(res, ms)); }
+
+  async function fetchWithRetry(url, options, attempts = 5, initialDelayMs = 1200) {
+    let delayMs = initialDelayMs;
+    let lastStatus = 0;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const res = await fetch(url, options);
+        if (res.ok) return res;
+        lastStatus = res.status;
+        if (res.status === 429 || res.status === 503) {
+          const retryAfter = res.headers.get("retry-after");
+          const waitMs = retryAfter ? Number(retryAfter) * 1000 : delayMs;
+          await sleep(waitMs);
+          delayMs = Math.min(delayMs * 2, 8000);
+          continue;
+        }
+        throw new Error(`HTTP ${res.status}`);
+      } catch (err) {
+        // Network error: backoff and retry
+        await sleep(delayMs);
+        delayMs = Math.min(delayMs * 2, 8000);
+      }
+    }
+    throw new Error(`Request failed after retries (last status ${lastStatus || "network"})`);
+  }
+
   async function fetchWikidata(ageYears, limit, offset, lang) {
     const endpoint = "https://query.wikidata.org/sparql";
-    const url = endpoint + "?format=json&query=" + encodeURIComponent(sparqlQuery(ageYears, limit, offset, lang));
-    const res = await fetch(url, {
+    const url = endpoint + "?format=json&timeout=30000&query=" + encodeURIComponent(sparqlQuery(ageYears, limit, offset, lang));
+    const res = await fetchWithRetry(url, {
       headers: {
         "Accept": "application/sparql-results+json"
       },
@@ -212,7 +239,7 @@ OFFSET ${offset}`;
     const cached = cacheGet(cacheKey);
     if (cached) return cached;
     const api = `https://${lang}.wikipedia.org/api/rest_v1/page/summary/` + encodeURIComponent(title);
-    const res = await fetch(api, { headers: { Accept: "application/json" } });
+    const res = await fetchWithRetry(api, { headers: { Accept: "application/json" } }, 4, 800);
     if (!res.ok) throw new Error("Wikipedia error: " + res.status);
     const json = await res.json();
     const value = {
@@ -331,8 +358,8 @@ OFFSET ${offset}`;
     }
     try {
       const rows = await fetchWikidata(state.ageYears, state.limit, state.offset, state.lang);
-      // For each row, fetch summary if we have sitelink title
-      const enriched = await Promise.all(rows.map(async (r) => {
+      // For each row, fetch summary with limited concurrency to avoid 429
+      const enriched = await mapWithConcurrency(rows, 6, async (r) => {
         let summary = null;
         try {
           if (r.article) {
@@ -342,7 +369,7 @@ OFFSET ${offset}`;
           }
         } catch (_) {}
         return { ...r, summary };
-      }));
+      });
 
       if (reset) dom.cardsGrid.innerHTML = "";
       dom.cardsGrid.removeAttribute("aria-busy");
@@ -359,6 +386,21 @@ OFFSET ${offset}`;
     } finally {
       state.isLoading = false;
     }
+  }
+
+  async function mapWithConcurrency(items, concurrency, mapper) {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    async function worker() {
+      while (true) {
+        const current = nextIndex++;
+        if (current >= items.length) return;
+        results[current] = await mapper(items[current], current);
+      }
+    }
+    const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, worker);
+    await Promise.all(workers.map((w) => w()));
+    return results;
   }
 
   function onSearch() {
